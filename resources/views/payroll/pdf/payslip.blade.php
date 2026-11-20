@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Payslip - {{ $employee->name }}</title>
+    <style>
+        body { font-family: 'Helvetica', 'Arial', sans-serif; font-size: 12px; color: #333; margin: 0; padding: 0; }
+        .header { text-align: center; border-bottom: 2px solid #434AFA; padding-bottom: 15px; margin-bottom: 20px; }
+        .header h1 { margin: 0; color: #434AFA; font-size: 24px; }
+        .header p { margin: 5px 0 0; font-size: 14px; color: #666; }
+        .emp-details { width: 100%; margin-bottom: 20px; border-collapse: collapse; }
+        .emp-details td { padding: 5px; border-bottom: 1px solid #eee; }
+        .emp-details td:nth-child(odd) { font-weight: bold; width: 20%; color: #555; }
+        .emp-details td:nth-child(even) { width: 30%; }
+        .salary-breakdown { width: 100%; border-collapse: collapse; margin-bottom: 20px; }
+        .salary-breakdown th { background: #434AFA; color: white; padding: 8px; text-align: left; }
+        .salary-breakdown td { padding: 8px; border: 1px solid #eee; }
+        .salary-breakdown .amount { text-align: right; }
+        .total-row td { font-weight: bold; background: #f9f9f9; }
+        .net-pay { text-align: right; margin-top: 30px; font-size: 16px; font-weight: bold; padding: 15px; background: #f0f4ff; border: 1px solid #c8d9ff; border-radius: 4px; }
+        .net-pay span { color: #434AFA; font-size: 20px; }
+        .footer { position: fixed; bottom: 30px; width: 100%; text-align: center; font-size: 10px; color: #999; border-top: 1px solid #eee; padding-top: 10px; }
+    </style>
+</head>
+<body>
+
+    <div class="header">
+        <h1>Payslip</h1>
+        <p>For the month of {{ date('F Y', mktime(0, 0, 0, $payroll->month, 1, $payroll->year)) }}</p>
+    </div>
+
+    <table class="emp-details">
+        <tr>
+            <td>Employee Name:</td>
+            <td>{{ $employee->name }}</td>
+            <td>Employee Code:</td>
+            <td>{{ $employee->employee_code ?? 'N/A' }}</td>
+        </tr>
+        <tr>
+            <td>Designation:</td>
+            <td>{{ $employee->designation->name ?? 'N/A' }}</td>
+            <td>Department:</td>
+            <td>{{ $employee->department->name ?? 'N/A' }}</td>
+        </tr>
+    </table>
+
+    <table class="salary-breakdown">
+        <thead>
+            <tr>
+                <th style="width: 40%;">Earnings Component</th>
+                <th class="amount" style="width: 30%;">Monthly Rate (Rs.)</th>
+                <th class="amount" style="width: 30%;">Earned Amount (Rs.)</th>
+            </tr>
+        </thead>
+        <tbody>
+            @php 
+                $totalContracted = 0; 
+                $totalEarned = 0;
+            @endphp
+            @foreach($earnings as $earning)
+            @php 
+                $cEarned = isset($earning->earned_amount) && $earning->earned_amount !== null ? $earning->earned_amount : $earning->amount;
+                $totalContracted += $earning->amount;
+                $totalEarned += $cEarned;
+            @endphp
+            <tr>
+                <td>{{ $earning->salaryComponent->name }}</td>
+                <td class="amount">{{ number_format($earning->amount, 2) }}</td>
+                <td class="amount fw-bold">{{ number_format($cEarned, 2) }}</td>
+            </tr>
+            @endforeach
+            <tr class="total-row">
+                <td>Total Gross</td>
+                <td class="amount">{{ number_format($totalContracted, 2) }}</td>
+                <td class="amount">{{ number_format($totalEarned, 2) }}</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <table class="salary-breakdown">
+        <thead>
+            <tr>
+                <th style="width: 50%;">Deductions</th>
+                <th class="amount" style="width: 50%;">Amount (Rs.)</th>
+            </tr>
+        </thead>
+        <tbody>
+            @php $totalDeductions = 0; @endphp
+            @foreach($deductions as $deduction)
+            <tr>
+                <td>{{ $deduction->salaryComponent->name }}</td>
+                <td class="amount">{{ number_format($deduction->amount, 2) }}</td>
+            </tr>
+            @php $totalDeductions += $deduction->amount; @endphp
+            @endforeach
+            @if($detail->lop_deduction_amount > 0)
+            <tr>
+                <td>Loss of Pay (LOP)</td>
+                <td class="amount">{{ number_format($detail->lop_deduction_amount, 2) }}</td>
+            </tr>
+            @php $totalDeductions += $detail->lop_deduction_amount; @endphp
+            @endif
+            @if(isset($detail->joining_deduction_amount) && $detail->joining_deduction_amount > 0)
+            <tr>
+                <td>Mid-month Joining Adjustment</td>
+                <td class="amount">{{ number_format($detail->joining_deduction_amount, 2) }}</td>
+            </tr>
+            @php $totalDeductions += $detail->joining_deduction_amount; @endphp
+            @endif
+            @if(isset($detail->pf_deduction_amount) && ($detail->pf_deduction_amount > 0 || $detail->esi_deduction_amount > 0))
+                @if($detail->pf_deduction_amount > 0)
+                <tr>
+                    <td>Provident Fund (PF)</td>
+                    <td class="amount">{{ number_format($detail->pf_deduction_amount, 2) }}</td>
+                </tr>
+                @php $totalDeductions += $detail->pf_deduction_amount; @endphp
+                @endif
+                @if($detail->esi_deduction_amount > 0)
+                <tr>
+                    <td>ESI Deduction</td>
+                    <td class="amount">{{ number_format($detail->esi_deduction_amount, 2) }}</td>
+                </tr>
+                @php $totalDeductions += $detail->esi_deduction_amount; @endphp
+                @endif
+            @elseif($detail->statutory_deduction_amount > 0)
+            <tr>
+                <td>Statutory Deductions</td>
+                <td class="amount">{{ number_format($detail->statutory_deduction_amount, 2) }}</td>
+            </tr>
+            @php $totalDeductions += $detail->statutory_deduction_amount; @endphp
+            @endif
+            @if($deductions->isEmpty() && $detail->lop_deduction_amount <= 0 && (empty($detail->joining_deduction_amount) || $detail->joining_deduction_amount <= 0) && $detail->statutory_deduction_amount <= 0 && (empty($detail->pf_deduction_amount) || $detail->pf_deduction_amount <= 0) && (empty($detail->esi_deduction_amount) || $detail->esi_deduction_amount <= 0))
+            <tr>
+                <td>No Deductions</td>
+                <td class="amount">0.00</td>
+            </tr>
+            @endif
+            <tr class="total-row">
+                <td>Total Deductions</td>
+                <td class="amount">{{ number_format($detail->total_deductions, 2) }}</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="net-pay">
+        Net Salary: <span>Rs. {{ number_format($detail->net_salary, 2) }}</span>
+    </div>
+
+    <div class="footer">
+        This is a system generated payslip and does not require a signature.
+    </div>
+
+</body>
+</html>

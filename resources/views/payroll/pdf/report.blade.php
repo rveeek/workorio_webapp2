@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Payroll Report</title>
+    <style>
+        @page {
+            margin: 10px 15px;
+        }
+        body { font-family: 'Helvetica', 'Arial', sans-serif; font-size: 8px; color: #333; margin: 0; padding: 0; }
+        h2 { text-align: center; color: #434AFA; margin-bottom: 5px; }
+        p.subtitle { text-align: center; margin-top: 0; color: #666; font-size: 10px; margin-bottom: 15px; }
+        table { width: 100%; border-collapse: collapse; margin-bottom: 20px; table-layout: auto; }
+        th, td { border: 1px solid #ddd; padding: 3px 4px; text-align: center; }
+        th { background-color: #f4f6f9; color: #333; font-weight: bold; }
+        .text-start { text-align: left; }
+        .text-end { text-align: right; }
+        .nowrap { white-space: nowrap; }
+    </style>
+</head>
+<body>
+    <h2>Salary & Attendance Summary</h2>
+    <p class="subtitle">For the month of {{ date('F Y', mktime(0, 0, 0, $month, 1, $year)) }}</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th class="text-start nowrap">Emp Code</th>
+                <th class="text-start nowrap">Employee Name</th>
+                <th class="text-start nowrap">Employment Type</th>
+                <th class="text-start nowrap">Branch</th>
+                <th class="text-start nowrap">Department</th>
+                @foreach($uniqueComponents as $comp)
+                <th class="text-end">{{ $comp }}</th>
+                @endforeach
+                <th class="text-end nowrap">Gross Salary</th>
+                <th>Working Days</th>
+                <th>Total Present</th>
+                <th>Full Day</th>
+                <th>Half Day</th>
+                <th>Unpaid Half Day</th>
+                <th>Leave</th>
+                <th>Unpaid Leave</th>
+                <th>Absent</th>
+                <th>Total Weekly Off</th>
+                <th>Total Holidays</th>
+                <th>Total Deduction Days</th>
+                <th class="text-end">Days deduction amount</th>
+                <th class="text-end">Advance Deduction</th>
+                <th class="text-end">Loan Deduction</th>
+                @foreach($uniqueComponents as $comp)
+                <th class="text-end">Earned {{ $comp }}</th>
+                @endforeach
+                <th class="text-end nowrap">Earned Gross</th>
+                @if($showPf ?? true)
+                <th class="text-end">PF Deduction</th>
+                @endif
+                @if($showEsi ?? true)
+                <th class="text-end">ESI Deduction</th>
+                @endif
+                <th class="text-end">Total Deduction</th>
+                <th class="text-end">Salary</th>
+                @if(isset($withPenalty) && $withPenalty)
+                <th class="text-center">Total Lates</th>
+                <th class="text-center">Exempted Lates</th>
+                <th class="text-center">Eligible Lates</th>
+                <th class="text-end">Penalty Days</th>
+                <th class="text-end">Penalty Amount</th>
+                <th class="text-end">Final Salary</th>
+                @endif
+                @if($showPf ?? true)
+                <th class="text-end">Employer PF</th>
+                @endif
+                @if($showEsi ?? true)
+                <th class="text-end">Employer ESI</th>
+                @endif
+                @if($showEmployerCont ?? true)
+                <th class="text-end">Total Employer Cont.</th>
+                @endif
+            </tr>
+        </thead>
+        <tbody>
+            @php 
+                $showPf = $showPf ?? true;
+                $showEsi = $showEsi ?? true;
+                $showEmployerCont = $showEmployerCont ?? ($showPf || $showEsi);
+                $grandTotalPaidSalary = 0; 
+                $colTotals = [
+                    'gross_salary' => 0,
+                    'working_days' => 0, 'total_present' => 0, 'full_day' => 0, 'half_day' => 0, 'unpaid_half_day' => 0,
+                    'leave' => 0, 'unpaid_leave' => 0, 'absent' => 0, 'weekly_offs' => 0, 'holidays' => 0,
+                    'deduction_days' => 0, 'lop_deduction' => 0, 'advance_deduction' => 0, 'loan_deduction' => 0,
+                    'pf_deduction' => 0, 'esi_deduction' => 0,
+                    'total_deduction' => 0, 'salary' => 0, 'total_lates' => 0, 'exempted_lates' => 0, 'eligible_lates' => 0,
+                    'penalty_days' => 0, 'penalty_amount' => 0, 'final_salary' => 0,
+                    'employer_pf' => 0, 'employer_esi' => 0, 'total_employer_cont' => 0
+                ];
+                $compTotals = [];
+                $earnedCompTotals = [];
+                foreach($uniqueComponents as $comp) {
+                    $compTotals[$comp] = 0;
+                    $earnedCompTotals[$comp] = 0;
+                }
+                $colTotals['earned_gross_salary'] = 0;
+            @endphp
+            @foreach($summaries as $summary)
+                @php
+                    $paid = $paidSalaries[$summary->employee_id] ?? null;
+                    $comps = $employeeComponents[$summary->employee_id] ?? [];
+                    $deductionAmount = $employeeDeductions[$summary->employee_id] ?? 0;
+                    $advanceDeduction = $employeeAdvanceDeductions[$summary->employee_id] ?? 0;
+                    $loanDeduction = $employeeLoanDeductions[$summary->employee_id] ?? 0;
+                    $lopDeduction = $employeeLopDeductions[$summary->employee_id] ?? 0;
+                    $pfDeduction = $employeePfDeductions[$summary->employee_id] ?? 0;
+                    $esiDeduction = $employeeEsiDeductions[$summary->employee_id] ?? 0;
+                    $penaltyDays = $employeePenaltyDays[$summary->employee_id] ?? 0;
+                    $penaltyAmount = $employeePenaltyAmounts[$summary->employee_id] ?? 0;
+                    $totalLates = $employeeTotalLates[$summary->employee_id] ?? 0;
+                    
+                    $unpaidHalfday = isset($summary->total_unpaid_halfday) ? (float) $summary->total_unpaid_halfday : (float) ($summary->total_halfday ?? 0);
+                    $deductionDays = ($summary->total_unpaid_leaves ?? 0) + ($summary->days_absent ?? 0) + ($unpaidHalfday * 0.5);
+                    $payableDays = ($summary->total_working_days ?? 0) - $deductionDays;
+                    if ($paid !== null) {
+                        $grandTotalPaidSalary += (float)((isset($withPenalty) && $withPenalty) ? $paid : ($paid + $penaltyAmount));
+                    }
+                    
+                    $empGross = isset($grossSalaries[$summary->employee_id]) 
+                        ? (float) $grossSalaries[$summary->employee_id] 
+                        : (count($comps) > 0 ? array_sum($comps) : 0);
+                    $colTotals['gross_salary'] += $empGross;
+
+                    $earnedComps = $employeeEarnedComponents[$summary->employee_id] ?? [];
+                    $empEarnedGross = isset($earnedGrossSalaries[$summary->employee_id])
+                        ? (float) $earnedGrossSalaries[$summary->employee_id]
+                        : (count($earnedComps) > 0 ? array_sum($earnedComps) : ($empGross - $lopDeduction));
+                    $colTotals['earned_gross_salary'] += $empEarnedGross;
+
+                    $colTotals['working_days'] += $summary->total_working_days ?? 0;
+                    $colTotals['total_present'] += $summary->total_present_combined ?? 0;
+                    $colTotals['full_day'] += $summary->total_present ?? 0;
+                    $colTotals['half_day'] += $summary->total_halfday ?? 0;
+                    $colTotals['unpaid_half_day'] += $unpaidHalfday;
+                    $colTotals['leave'] += $summary->days_on_leave ?? 0;
+                    $colTotals['unpaid_leave'] += $summary->total_unpaid_leaves ?? 0;
+                    $colTotals['absent'] += $summary->days_absent ?? 0;
+                    $colTotals['weekly_offs'] += $summary->total_weekly_offs ?? 0;
+                    $colTotals['holidays'] += $summary->total_holidays ?? 0;
+                    $colTotals['deduction_days'] += $deductionDays;
+                    $colTotals['lop_deduction'] += $lopDeduction;
+                    $colTotals['advance_deduction'] += $advanceDeduction;
+                    $colTotals['loan_deduction'] += $loanDeduction;
+                    $colTotals['pf_deduction'] += $pfDeduction;
+                    $colTotals['esi_deduction'] += $esiDeduction;
+                    $colTotals['total_deduction'] += ($deductionAmount - $penaltyAmount);
+                    $employerPf = $employeeEmployerPfs[$summary->employee_id] ?? 0;
+                    $employerEsi = $employeeEmployerEsis[$summary->employee_id] ?? 0;
+                    $totalEmployer = $employeeEmployerTotals[$summary->employee_id] ?? 0;
+                    $colTotals['employer_pf'] += $employerPf;
+                    $colTotals['employer_esi'] += $employerEsi;
+                    $colTotals['total_employer_cont'] += $totalEmployer;
+
+                    if ($paid !== null) {
+                        $colTotals['salary'] += ($paid + $penaltyAmount);
+                        if (isset($withPenalty) && $withPenalty) {
+                            $colTotals['total_lates'] += $totalLates;
+                            $colTotals['exempted_lates'] += $employeeExemptedLates[$summary->employee_id] ?? 0;
+                            $colTotals['eligible_lates'] += $employeeActualLates[$summary->employee_id] ?? 0;
+                            $colTotals['penalty_days'] += $penaltyDays;
+                            $colTotals['penalty_amount'] += $penaltyAmount;
+                            $colTotals['final_salary'] += $paid;
+                        }
+                    }
+                @endphp
+                @php
+                    $empType = !empty($employeeEmploymentTypes[$summary->employee_id]) 
+                        ? $employeeEmploymentTypes[$summary->employee_id] 
+                        : '-';
+                @endphp
+                <tr>
+                    <td class="text-start nowrap">{{ $summary->employee ? $summary->employee->employee_code : '-' }}</td>
+                    <td class="text-start nowrap">{{ $summary->employee ? $summary->employee->name : 'Unknown' }}</td>
+                    <td class="text-start nowrap">{{ $empType }}</td>
+                    <td class="text-start nowrap">{{ $summary->employee && $summary->employee->branch ? $summary->employee->branch->name : '-' }}</td>
+                    <td class="text-start nowrap">{{ $summary->employee && $summary->employee->departmentRelation ? $summary->employee->departmentRelation->name : '-' }}</td>
+                    
+                    @foreach($uniqueComponents as $comp)
+                        @php
+                            $cVal = isset($comps[$comp]) ? round($comps[$comp]) : 0;
+                            $compTotals[$comp] += $cVal;
+                        @endphp
+                        <td class="text-end">{{ $cVal }}</td>
+                    @endforeach
+                    <td class="text-end fw-bold">{{ round($empGross) }}</td>
+                    
+                    <td>{{ $summary->total_working_days ?? 0 }}</td>
+                    <td>{{ $summary->total_present_combined ?? 0 }}</td>
+                    <td>{{ $summary->total_present ?? 0 }}</td>
+                    <td>{{ $summary->total_halfday ?? 0 }}</td>
+                    <td>{{ $unpaidHalfday }}</td>
+                    <td>{{ $summary->days_on_leave ?? 0 }}</td>
+                    <td>{{ $summary->total_unpaid_leaves ?? 0 }}</td>
+                    <td>{{ $summary->days_absent ?? 0 }}</td>
+                    <td>{{ $summary->total_weekly_offs ?? 0 }}</td>
+                    <td>{{ $summary->total_holidays ?? 0 }}</td>
+                    <td>{{ $deductionDays }}</td>
+                    <td class="text-end">{{ $lopDeduction }}</td>
+                    <td class="text-end">{{ $advanceDeduction }}</td>
+                    <td class="text-end">{{ $loanDeduction }}</td>
+                    @foreach($uniqueComponents as $comp)
+                        @php
+                            $cEarnedVal = isset($earnedComps[$comp]) ? round($earnedComps[$comp]) : (isset($comps[$comp]) ? round($comps[$comp]) : 0);
+                            $earnedCompTotals[$comp] += $cEarnedVal;
+                        @endphp
+                        <td class="text-end">{{ $cEarnedVal }}</td>
+                    @endforeach
+                    <td class="text-end fw-bold">{{ round($empEarnedGross) }}</td>
+                    @if($showPf)
+                    <td class="text-end">{{ $pfDeduction }}</td>
+                    @endif
+                    @if($showEsi)
+                    <td class="text-end">{{ $esiDeduction }}</td>
+                    @endif
+                    <td class="text-end">{{ $deductionAmount - $penaltyAmount }}</td>
+                    <td class="text-end nowrap">{{ $paid !== null ? number_format($paid + $penaltyAmount, 0, '', '') : 'Not Generated' }}</td>
+                    @if(isset($withPenalty) && $withPenalty)
+                    <td class="text-center">{{ $totalLates }}</td>
+                    <td class="text-center">{{ $employeeExemptedLates[$summary->employee_id] ?? 0 }}</td>
+                    <td class="text-center">{{ $employeeActualLates[$summary->employee_id] ?? 0 }}</td>
+                    <td class="text-end">{{ $penaltyDays }}</td>
+                    <td class="text-end">{{ $penaltyAmount }}</td>
+                    <td class="text-end nowrap">{{ $paid !== null ? number_format($paid, 0, '', '') : 'Not Generated' }}</td>
+                    @endif
+                    @if($showPf)
+                    <td class="text-end nowrap">{{ number_format($employerPf, 2, '.', '') }}</td>
+                    @endif
+                    @if($showEsi)
+                    <td class="text-end nowrap">{{ number_format($employerEsi, 2, '.', '') }}</td>
+                    @endif
+                    @if($showEmployerCont)
+                    <td class="text-end nowrap">{{ number_format($totalEmployer, 2, '.', '') }}</td>
+                    @endif
+                </tr>
+            @endforeach
+            @if($summaries->isNotEmpty())
+                <tr style="font-weight: bold; background-color: #f4f6f9;">
+                    <td colspan="5" class="text-end">Total:</td>
+                    @foreach($uniqueComponents as $comp)
+                        <td class="text-end">{{ $compTotals[$comp] }}</td>
+                    @endforeach
+                    <td class="text-end nowrap">{{ round($colTotals['gross_salary']) }}</td>
+                    <td>{{ $colTotals['working_days'] }}</td>
+                    <td>{{ $colTotals['total_present'] }}</td>
+                    <td>{{ $colTotals['full_day'] }}</td>
+                    <td>{{ $colTotals['half_day'] }}</td>
+                    <td>{{ $colTotals['unpaid_half_day'] }}</td>
+                    <td>{{ $colTotals['leave'] }}</td>
+                    <td>{{ $colTotals['unpaid_leave'] }}</td>
+                    <td>{{ $colTotals['absent'] }}</td>
+                    <td>{{ $colTotals['weekly_offs'] }}</td>
+                    <td>{{ $colTotals['holidays'] }}</td>
+                    <td>{{ $colTotals['deduction_days'] }}</td>
+                    <td class="text-end">{{ $colTotals['lop_deduction'] }}</td>
+                    <td class="text-end">{{ $colTotals['advance_deduction'] }}</td>
+                    <td class="text-end">{{ $colTotals['loan_deduction'] }}</td>
+                    @foreach($uniqueComponents as $comp)
+                        <td class="text-end">{{ $earnedCompTotals[$comp] }}</td>
+                    @endforeach
+                    <td class="text-end nowrap fw-bold">{{ round($colTotals['earned_gross_salary']) }}</td>
+                    @if($showPf)
+                    <td class="text-end">{{ $colTotals['pf_deduction'] }}</td>
+                    @endif
+                    @if($showEsi)
+                    <td class="text-end">{{ $colTotals['esi_deduction'] }}</td>
+                    @endif
+                    <td class="text-end">{{ $colTotals['total_deduction'] }}</td>
+                    <td class="text-end nowrap">{{ number_format($colTotals['salary'], 0, '', '') }}</td>
+                    @if(isset($withPenalty) && $withPenalty)
+                    <td class="text-center">{{ $colTotals['total_lates'] }}</td>
+                    <td class="text-center">{{ $colTotals['exempted_lates'] }}</td>
+                    <td class="text-center">{{ $colTotals['eligible_lates'] }}</td>
+                    <td class="text-end">{{ $colTotals['penalty_days'] }}</td>
+                    <td class="text-end">{{ $colTotals['penalty_amount'] }}</td>
+                    <td class="text-end nowrap">{{ number_format($colTotals['final_salary'], 0, '', '') }}</td>
+                    @endif
+                    @if($showPf)
+                    <td class="text-end nowrap">{{ number_format($colTotals['employer_pf'], 2, '.', '') }}</td>
+                    @endif
+                    @if($showEsi)
+                    <td class="text-end nowrap">{{ number_format($colTotals['employer_esi'], 2, '.', '') }}</td>
+                    @endif
+                    @if($showEmployerCont)
+                    <td class="text-end nowrap">{{ number_format($colTotals['total_employer_cont'], 2, '.', '') }}</td>
+                    @endif
+                </tr>
+
+            @endif
+            @if($summaries->isEmpty())
+                @php
+                    $emptyColspan = 4 + count($uniqueComponents) + 1 + 14 + ($showPf ? 1 : 0) + ($showEsi ? 1 : 0) + 2 + ((isset($withPenalty) && $withPenalty) ? 6 : 0) + ($showPf ? 1 : 0) + ($showEsi ? 1 : 0) + ($showEmployerCont ? 1 : 0);
+                @endphp
+                <tr>
+                    <td colspan="{{ $emptyColspan }}">No data available for this month.</td>
+                </tr>
+            @endif
+        </tbody>
+    </table>
+</body>
+</html>

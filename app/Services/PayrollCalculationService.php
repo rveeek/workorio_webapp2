@@ -1,0 +1,692 @@
+<?php
+
+namespace App\Services;
+
+use App\Models\Employee;
+use App\Models\EmployeeSalary;
+use App\Models\MonthlyAttendanceSummary;
+use App\Models\Payroll;
+use App\Models\PayrollDetail;
+use App\Models\PayrollComponentDetail;
+use App\Models\PayrollSetting;
+use App\Models\StatutoryRule;
+use Carbon\Carbon;
+use Illuminate\Support\Facades\DB;
+use Symfony\Component\ExpressionLanguage\ExpressionLanguage;
+
+class PayrollCalculationService
+{
+    protected $expressionLanguage;
+    protected $settings;
+    protected $statutoryRules;
+
+    public function __construct()
+    {
+        $this->expressionLanguage = new ExpressionLanguage();
+    }
+
+    /**
+     * Process payroll for a specific month and year
+     */
+    public function processPayroll($month, $year)
+    {
+        $this->settings = PayrollSetting::first() ?? new PayrollSetting();
+        
+        $this->statutoryRules = StatutoryRule::all()->keyBy('type');
+        
+        $payroll = Payroll::firstOrCreate(
+            ['month' => $month, 'year' => $year],
+            ['status' => 'Draft']
+        );
+
+        // Fetch all locked attendance summaries for the month
+        $summaries = MonthlyAttendanceSummary::where('month', $month)
+            ->where('year', $year)
+            ->where('is_locked', true)
+            ->get();
+
+        foreach ($summaries as $summary) {
+            $this->calculateEmployeePayroll($payroll, $summary);
+        }
+
+        return $payroll;
+    }
+
+    /**
+     * Calculate payroll for a single employee based on their attendance summary
+     */
+    protected function calculateEmployeePayroll(Payroll $payroll, MonthlyAttendanceSummary $summary)
+    {
+        $employeeId = $summary->employee_id;
+        
+        // Load employee
+        $employee = \App\Models\Employee::with(['shiftHistory', 'shiftRelation', 'user', 'employmentTypeRelation'])->find($employeeId);
+
+        // Get employee's salary structure
+        $employeeSalary = EmployeeSalary::where('employee_id', $employeeId)
+            ->where('effective_from', '<=', Carbon::create($summary->year, $summary->month)->endOfMonth())
+            ->orderBy('effective_from', 'desc')
+            ->orderBy('id', 'desc')
+            ->first();
+
+        if (!$employeeSalary || !$employeeSalary->structure) {
+            return; // Cannot process without salary structure
+        }
+
+        $fullGrossSalary = (float) $employeeSalary->gross_salary;
+        $components = $employeeSalary->structure->components;
+
+        // Mid-month joining pro-rata calculation
+        $monthStart = Carbon::create($summary->year, $summary->month, 1)->startOfMonth();
+        $monthEnd = $monthStart->copy()->endOfMonth();
+        $joiningDate = $employee && $employee->date_of_joining ? Carbon::parse($employee->date_of_joining) : null;
+        
+        $isMidMonthJoiner = $joiningDate && $joiningDate->between($monthStart, $monthEnd) && $joiningDate->gt($monthStart);
+        $proRataFactor = 1.0;
+        $joiningDeductionAmount = 0;
+
+        if ($isMidMonthJoiner) {
+            // Count total calendar days in month vs remaining days from joining date (inclusive of joining day)
+            $totalMonthDays = $monthStart->daysInMonth;
+            $remainingDays = $joiningDate->copy()->startOfDay()->diffInDays($monthEnd->copy()->startOfDay()) + 1;
+            
+            $proRataFactor = max(0.0, min(1.0, $remainingDays / $totalMonthDays));
+            // Joining deduction amount: the portion of monthly gross for calendar days prior to joining
+            $joiningDeductionAmount = round($fullGrossSalary * (1.0 - $proRataFactor));
+        }
+
+        // Mid-month joiner tenure prorated gross (for statutory context and net calculation)
+        $proratedGrossSalary = round($fullGrossSalary * $proRataFactor);
+        // Gross salary displayed on structure represents full monthly package
+        $grossSalary = $fullGrossSalary;
+
+        // Calculate attendance factor based on attendance deduction days (absent + unpaid leaves + halfdays * 0.5)
+        $attendanceFactor = 1.0;
+        $deductionDays = (float) ($summary->total_deduction_days ?? 0);
+        if ($this->settings->attendance_based && $deductionDays > 0) {
+            // Standard working days divisor is 26
+            $attendanceFactor = max(0.0, 1.0 - ($deductionDays / 26));
+        }
+
+        // Calculate Loss of Pay (LOP) based on total deduction days if setting is enabled
+        $deductionAmount = 0;
+        if ($this->settings->attendance_based && $deductionDays > 0) {
+            $perDaySalary = $fullGrossSalary / 26;
+            $deductionAmount = round($perDaySalary * $deductionDays);
+        }
+
+        $calculatedComponents = [];
+        $earnedComponents = [];
+        $totalEarnings = 0;
+        $totalEarnedEarnings = 0;
+        $totalDeductions = 0;
+        
+        // Context for expression language
+        $context = [
+            'employee_id' => $employeeId,
+            'gross' => $grossSalary,
+            'base_gross' => $fullGrossSalary,
+            'working_days' => $summary->total_working_days,
+            'payable_days' => $summary->days_worked + $summary->days_on_leave + $summary->total_holidays + $summary->total_weekly_offs,
+            'absent_days' => $summary->days_absent
+        ];
+
+        $breakdown = $employeeSalary->component_breakdown;
+        if (is_string($breakdown)) {
+            $breakdown = json_decode($breakdown, true);
+        }
+        $breakdown = is_array($breakdown) ? $breakdown : [];
+
+        // First Pass: Calculate all fixed and percentage earnings to build full monthly structure
+        // Earning components store the full monthly contracted entitlement for report clarity
+        $attendanceDeductionRatio = $fullGrossSalary > 0 
+            ? min(1.0, ($deductionAmount + $joiningDeductionAmount) / $fullGrossSalary) 
+            : 0;
+        $effectiveFactor = max(0.0, 1.0 - $attendanceDeductionRatio);
+
+        foreach ($components as $component) {
+            if ($component->type === 'earning') {
+                $compSlug = strtolower(str_replace(' ', '_', $component->name));
+                if (isset($breakdown[$component->id]) && is_numeric($breakdown[$component->id])) {
+                    $amount = round((float) $breakdown[$component->id]);
+                } elseif (isset($breakdown[$compSlug]) && is_numeric($breakdown[$compSlug])) {
+                    $amount = round((float) $breakdown[$compSlug]);
+                } else {
+                    $amount = $this->calculateComponentValue($component, $context, $grossSalary);
+                }
+
+                $calculatedComponents[$component->id] = $amount;
+                $earnedAmount = round($amount * $effectiveFactor);
+                $earnedComponents[$component->id] = $earnedAmount;
+
+                // Add to context by name for other formulas (e.g., basic)
+                $context[$compSlug] = $amount;
+                $totalEarnings += $amount;
+                $totalEarnedEarnings += $earnedAmount;
+            }
+        }
+
+        // Second Pass: Deductions and Employer Contributions (which might depend on earnings like 'basic')
+        foreach ($components as $component) {
+            if (in_array($component->type, ['deduction', 'employer_contribution'])) {
+                $compSlug = strtolower(str_replace(' ', '_', $component->name));
+                if (isset($breakdown[$component->id]) && is_numeric($breakdown[$component->id])) {
+                    $amount = round((float) $breakdown[$component->id]);
+                } elseif (isset($breakdown[$compSlug]) && is_numeric($breakdown[$compSlug])) {
+                    $amount = round((float) $breakdown[$compSlug]);
+                } else {
+                    $amount = $this->calculateComponentValue($component, $context, $grossSalary);
+                }
+
+                $calculatedComponents[$component->id] = $amount;
+                $earnedComponents[$component->id] = $amount;
+                
+                if ($component->type === 'deduction') {
+                    $totalDeductions += $amount;
+                }
+            }
+        }
+
+        // Build Earned Context for Statutory Deductions (PF / ESI computed on earned basic & earned gross)
+        // For mid-month joiners, wages are scaled by proRataFactor * attendanceFactor
+        $earnedContext = $context;
+        foreach ($context as $k => $v) {
+            if (is_numeric($v)) {
+                $earnedContext[$k] = round($v * $effectiveFactor);
+            }
+        }
+        $earnedEarnings = round($totalEarnings * $effectiveFactor);
+
+        // Apply Statutory Deductions on Earned Wages
+        $statutoryDeductions = $this->calculateStatutoryDeductions($earnedContext, $earnedEarnings, $employeeSalary);
+        foreach ($statutoryDeductions as $type => $amount) {
+            $totalDeductions += $amount;
+        }
+
+        // Calculate Employer Statutory Contributions on Earned Wages
+        $employerContributions = $this->calculateEmployerContributions($earnedContext, $earnedEarnings, $employeeSalary);
+        $employeePf = $statutoryDeductions['PF'] ?? 0;
+        $employeeEsi = $statutoryDeductions['ESI'] ?? 0;
+        $employerPf = $employerContributions['PF'] ?? 0;
+        $employerEsi = $employerContributions['ESI'] ?? 0;
+        $totalEmployer = $employerPf + $employerEsi;
+
+        // Apply LOP Deduction to total deductions
+        if ($deductionAmount > 0) {
+            $totalDeductions += $deductionAmount;
+        }
+
+        // Calculate Late Penalty
+        $penaltyDays = 0;
+        $penaltyAmount = 0;
+        // employee already loaded above
+        $shift = $employee ? $employee->getShiftForDate(Carbon::create($summary->year, $summary->month)->endOfMonth()) : null;
+        
+        $totalLateCount = $summary->late_count ?? 0;
+        $exemptedLateCount = 0;
+        $actualLateCount = $totalLateCount;
+
+        if ($employee && $totalLateCount > 0) {
+            $monthStart = Carbon::create($summary->year, $summary->month, 1)->format('Y-m-d');
+            $monthEnd = Carbon::create($summary->year, $summary->month)->endOfMonth()->format('Y-m-d');
+
+            $exemptions = \App\Models\PenaltyExemption::whereBetween('date', [$monthStart, $monthEnd])
+                ->where(function ($q) use ($employee) {
+                    $q->where(function($q1) use ($employee) {
+                        $q1->where('type', 'employee')->where('employee_id', $employee->id);
+                    })->orWhere(function($q2) use ($employee) {
+                        $q2->where('type', 'department')->where('department_id', $employee->department_id);
+                    })->orWhere(function($q3) use ($employee) {
+                        $q3->where('type', 'branch')->where('branch_id', $employee->branch_id);
+                    });
+                })->pluck('date');
+
+            if ($exemptions->isNotEmpty()) {
+                $exemptedLateCount = \App\Models\Attendance::where('user_id', $employee->user->id)
+                    ->whereIn('date', $exemptions)
+                    ->where('is_late', 1)
+                    ->count();
+            }
+
+            $actualLateCount = max(0, $totalLateCount - $exemptedLateCount);
+        }
+        
+        if ($shift && $shift->penalty_eligible_days > 0 && $shift->penalty_deduction_days > 0) {
+            if ($actualLateCount >= $shift->penalty_eligible_days) {
+                $penaltyDays = floor($actualLateCount / $shift->penalty_eligible_days) * $shift->penalty_deduction_days;
+                $perDaySalary = $grossSalary / 26;
+                $penaltyAmount = round($penaltyDays * $perDaySalary);
+                $totalDeductions += $penaltyAmount;
+            }
+        }
+
+        $preDeductionNetSalary = $totalEarnings - $totalDeductions;
+        $advanceDeduction = 0;
+        $calculatedAdvances = [];
+        $currentMonthStr = Carbon::create($summary->year, $summary->month)->format('Y-m');
+
+        // Fetch active salary advances
+        $advances = \App\Models\SalaryAdvance::where('employee_id', $employeeId)
+            ->where('status', 'approved')
+            ->where('deduction_start_month', '<=', $currentMonthStr)
+            ->get();
+
+        foreach ($advances as $adv) {
+            // Check if already deducted in this payroll run
+            $existingDeduction = \App\Models\SalaryAdvanceDeduction::where('salary_advance_id', $adv->id)
+                ->where('payroll_id', $payroll->id)
+                ->first();
+                
+            if ($existingDeduction) {
+                 $advanceDeduction += $existingDeduction->amount;
+                 continue;
+            }
+
+            $rem = $adv->remainingBalance();
+            if ($rem > 0 && ($preDeductionNetSalary - $advanceDeduction) > 0) {
+                $available = $preDeductionNetSalary - $advanceDeduction;
+                $toDeduct = min($rem, $available);
+                $advanceDeduction += $toDeduct;
+                
+                $calculatedAdvances[] = [
+                    'advance_id' => $adv->id,
+                    'amount' => $toDeduct,
+                    'adv' => $adv
+                ];
+            }
+        }
+
+        $preLoanNetSalary = $preDeductionNetSalary - $advanceDeduction;
+        $loanDeduction = 0;
+
+        // Fetch pending loan installments for this month
+        $currentMonthStr = Carbon::create($summary->year, $summary->month)->format('Y-m');
+        $installments = \App\Models\LoanInstallment::whereHas('loan', function($q) use ($employeeId) {
+            $q->where('employee_id', $employeeId)->where('status', 'active');
+        })->where('due_month', $currentMonthStr)->where('status', 'pending')->get();
+
+        foreach ($installments as $installment) {
+            if ($preLoanNetSalary - $loanDeduction >= $installment->amount) {
+                // Full deduction
+                $loanDeduction += $installment->amount;
+                $installment->update([
+                    'status' => 'paid', 
+                    'paid_on' => now(),
+                    'payroll_id' => $payroll->id
+                ]);
+            } else {
+                // Partial deduction handling
+                $availableForDeduction = max(0, $preLoanNetSalary - $loanDeduction);
+                if ($availableForDeduction > 0) {
+                    $loanDeduction += $availableForDeduction;
+                    $remainingInstallmentAmount = $installment->amount - $availableForDeduction;
+                    
+                    $installment->update([
+                        'original_amount' => $installment->amount,
+                        'amount' => $availableForDeduction,
+                        'status' => 'paid',
+                        'paid_on' => now(),
+                        'payroll_id' => $payroll->id
+                    ]);
+
+                    // Add remaining amount to next installment or create a new one
+                    $nextInstallment = \App\Models\LoanInstallment::where('loan_id', $installment->loan_id)
+                        ->where('status', 'pending')
+                        ->where('id', '!=', $installment->id)
+                        ->orderBy('installment_number', 'asc')
+                        ->first();
+
+                    if ($nextInstallment) {
+                        $nextInstallment->update([
+                            'original_amount' => $nextInstallment->original_amount ?? $nextInstallment->amount,
+                            'amount' => $nextInstallment->amount + $remainingInstallmentAmount,
+                            'payroll_id' => $payroll->id
+                        ]);
+                    } else {
+                        // Create a new installment for the remainder
+                        $loan = $installment->loan;
+                        $newDueMonth = Carbon::createFromFormat('Y-m', $currentMonthStr)->addMonth()->format('Y-m');
+                        \App\Models\LoanInstallment::create([
+                            'loan_id' => $loan->id,
+                            'installment_number' => $installment->installment_number + 1,
+                            'due_month' => $newDueMonth,
+                            'amount' => $remainingInstallmentAmount,
+                            'status' => 'pending',
+                            'payroll_id' => $payroll->id,
+                            'is_system_generated' => true
+                        ]);
+                        $loan->increment('total_installments');
+                    }
+                } else {
+                    // No salary left, skip entirely
+                    $installment->update([
+                        'status' => 'skipped',
+                        'skip_strategy' => 'add_to_next',
+                        'payroll_id' => $payroll->id
+                    ]);
+
+                    $nextInstallment = \App\Models\LoanInstallment::where('loan_id', $installment->loan_id)
+                        ->where('status', 'pending')
+                        ->where('id', '!=', $installment->id)
+                        ->orderBy('installment_number', 'asc')
+                        ->first();
+
+                    if ($nextInstallment) {
+                        $nextInstallment->update([
+                            'original_amount' => $nextInstallment->original_amount ?? $nextInstallment->amount,
+                            'amount' => $nextInstallment->amount + $installment->amount,
+                            'payroll_id' => $payroll->id
+                        ]);
+                    } else {
+                        $loan = $installment->loan;
+                        $newDueMonth = Carbon::createFromFormat('Y-m', $currentMonthStr)->addMonth()->format('Y-m');
+                        \App\Models\LoanInstallment::create([
+                            'loan_id' => $loan->id,
+                            'installment_number' => $installment->installment_number + 1,
+                            'due_month' => $newDueMonth,
+                            'amount' => $installment->amount,
+                            'status' => 'pending',
+                            'payroll_id' => $payroll->id,
+                            'is_system_generated' => true
+                        ]);
+                        $loan->increment('total_installments');
+                    }
+                }
+            }
+        }
+        
+        // Finalize Loan logic, Check if loan is completed
+        foreach ($installments as $installment) {
+            $loan = $installment->loan;
+            $pendingCount = $loan->installments()->where('status', 'pending')->count();
+            if ($pendingCount == 0 && $loan->remainingBalance() <= 0) {
+                $loan->update(['status' => 'completed']);
+            }
+        }
+
+        // Apply Mid-month Joining Pro-rata Adjustment to total deductions if applicable
+        if ($joiningDeductionAmount > 0) {
+            $totalDeductions += $joiningDeductionAmount;
+        }
+
+        $totalDeductions += $advanceDeduction + $loanDeduction;
+        $netSalary = $totalEarnings - $totalDeductions;
+
+        $employmentTypeName = $employee ? ($employee->employmentTypeRelation->name ?? $employee->employment_type ?? null) : null;
+
+        // Save Payroll Detail
+        $payrollDetailData = [
+            'employment_type' => $employmentTypeName,
+            'gross_salary' => $totalEarnings,
+            'earned_gross_salary' => $totalEarnedEarnings, 
+            'net_salary' => $netSalary,
+            'total_deductions' => $totalDeductions,
+            'lop_deduction_amount' => $deductionAmount,
+            'joining_deduction_amount' => $joiningDeductionAmount,
+            'statutory_deduction_amount' => array_sum($statutoryDeductions),
+            'loan_deduction_amount' => $loanDeduction,
+            'advance_deduction_amount' => $advanceDeduction,
+            'penalty_deduction_amount' => $penaltyAmount
+        ];
+
+        // Persist breakdown if columns exist in database table
+        $detailModel = new PayrollDetail();
+        if ($detailModel->getConnection()->getSchemaBuilder()->hasColumn('payroll_details', 'pf_deduction_amount')) {
+            $payrollDetailData['pf_deduction_amount'] = $employeePf;
+            $payrollDetailData['esi_deduction_amount'] = $employeeEsi;
+            $payrollDetailData['employer_pf_amount'] = $employerPf;
+            $payrollDetailData['employer_esi_amount'] = $employerEsi;
+            $payrollDetailData['employer_contribution_amount'] = $totalEmployer;
+        }
+
+        $payrollDetail = PayrollDetail::updateOrCreate(
+            ['payroll_id' => $payroll->id, 'employee_id' => $employeeId],
+            $payrollDetailData
+        );
+
+        // Save Penalty Detail
+        if ($totalLateCount > 0 || $penaltyAmount > 0) {
+            \App\Models\PayrollPenalty::updateOrCreate(
+                ['payroll_id' => $payroll->id, 'employee_id' => $employeeId],
+                [
+                    'payroll_detail_id' => $payrollDetail->id,
+                    'total_late_count' => $totalLateCount,
+                    'exempted_late_count' => $exemptedLateCount,
+                    'late_count' => $actualLateCount,
+                    'penalty_days' => $penaltyDays,
+                    'penalty_amount' => $penaltyAmount
+                ]
+            );
+        } else {
+            \App\Models\PayrollPenalty::where('payroll_id', $payroll->id)->where('employee_id', $employeeId)->delete();
+        }
+
+        // Save Advance Deductions
+        foreach ($calculatedAdvances as $calcAdv) {
+            \App\Models\SalaryAdvanceDeduction::create([
+                'salary_advance_id' => $calcAdv['advance_id'],
+                'payroll_id' => $payroll->id,
+                'amount' => $calcAdv['amount']
+            ]);
+            
+            if ($calcAdv['adv']->remainingBalance() <= 0) {
+                $calcAdv['adv']->update(['status' => 'completed']);
+            }
+        }
+
+        // Save Component Details
+        foreach ($calculatedComponents as $componentId => $amount) {
+            PayrollComponentDetail::updateOrCreate(
+                ['payroll_detail_id' => $payrollDetail->id, 'salary_component_id' => $componentId],
+                [
+                    'amount' => $amount,
+                    'earned_amount' => $earnedComponents[$componentId] ?? $amount
+                ]
+            );
+        }
+    }
+
+    /**
+     * Parse and calculate a single component value
+     */
+    protected function calculateComponentValue($component, $context, $gross)
+    {
+        $pivot = $component->pivot;
+        $employeeId = $context['employee_id'] ?? null;
+        
+        switch ($component->calculation_type) {
+            case 'fixed':
+                $val = round((float) $pivot->value);
+                return $val;
+            case 'percentage':
+                $val = round(($gross * (float) $pivot->value) / 100);
+                return $val;
+            case 'formula':
+                if (empty($pivot->formula)) return 0;
+                try {
+                    $val = round($this->expressionLanguage->evaluate($pivot->formula, $context));
+                    return $val;
+                } catch (\Exception $e) {
+                    \Log::error("Payroll Formula Error: " . $e->getMessage());
+                    return 0;
+                }
+            default:
+                return 0;
+            }
+    }
+
+    /**
+     * Calculate Statutory Deductions based on settings and rules
+     */
+    protected function calculateStatutoryDeductions($context, $totalEarnings, $employeeSalary = null)
+    {
+        $deductions = [];
+        $employeeId = $context['employee_id'] ?? null;
+
+        $isPfApplicable = $employeeSalary ? (bool) ($employeeSalary->is_pf_applicable ?? true) : true;
+        $isEsiApplicable = $employeeSalary ? (bool) ($employeeSalary->is_esi_applicable ?? true) : true;
+
+        // PF
+        if ($isPfApplicable && $this->settings->pf_enabled && isset($this->statutoryRules['PF'])) {
+            $rule = $this->statutoryRules['PF'];
+            
+            $calcOn = strtolower(trim($rule->calculate_on ?? ''));
+            $normCalcOn = str_replace([' ', '+'], '_', $calcOn);
+            if ($calcOn === 'basic' || $calcOn === 'basic + da' || $calcOn === 'basic_da' || $calcOn === 'basic_+_da') {
+                $baseForPF = $context['basic'] ?? $context['basic_+_da'] ?? $context['basic_da'] ?? 0;
+            } elseif (!empty($normCalcOn) && isset($context[$normCalcOn])) {
+                $baseForPF = $context[$normCalcOn];
+            } else {
+                $baseForPF = $totalEarnings;
+            }
+
+            if ($rule->salary_limit > 0 && $baseForPF > $rule->salary_limit) {
+                $baseForPF = $rule->salary_limit;
+            }
+            $deductions['PF'] = round(($baseForPF * $rule->employee_rate) / 100);
+        }
+
+        // ESI
+        if ($isEsiApplicable && $this->settings->esi_enabled && isset($this->statutoryRules['ESI'])) {
+            $rule = $this->statutoryRules['ESI'];
+            
+            $calcOn = strtolower(trim($rule->calculate_on ?? ''));
+            $normCalcOn = str_replace([' ', '+'], '_', $calcOn);
+            if ($calcOn === 'basic' || $calcOn === 'basic + da' || $calcOn === 'basic_da' || $calcOn === 'basic_+_da') {
+                $baseForESI = $context['basic'] ?? $context['basic_+_da'] ?? $context['basic_da'] ?? 0;
+            } elseif (!empty($normCalcOn) && isset($context[$normCalcOn])) {
+                $baseForESI = $context[$normCalcOn];
+            } else {
+                $baseForESI = $totalEarnings;
+            }
+
+            $hasLimit = $rule->salary_limit > 0;
+
+            if (!$hasLimit || $totalEarnings <= $rule->salary_limit) {
+                $deductions['ESI'] = round(($baseForESI * $rule->employee_rate) / 100);
+            }
+        }
+
+        // PT (simplified example)
+        if ($this->settings->pt_enabled && isset($this->statutoryRules['PT'])) {
+            $rule = $this->statutoryRules['PT'];
+            $deductions['PT'] = round($rule->employee_rate); // Often flat rate or slab based
+        }
+
+        return $deductions;
+    }
+
+    /**
+     * Calculate Employer Statutory Contributions based on settings and rules
+     */
+    protected function calculateEmployerContributions($context, $totalEarnings, $employeeSalary = null)
+    {
+        $contributions = [];
+
+        $isPfApplicable = $employeeSalary ? (bool) ($employeeSalary->is_pf_applicable ?? true) : true;
+        $isEsiApplicable = $employeeSalary ? (bool) ($employeeSalary->is_esi_applicable ?? true) : true;
+
+        // Employer PF
+        if ($isPfApplicable && ($this->settings->pf_enabled ?? false) && isset($this->statutoryRules['PF'])) {
+            $rule = $this->statutoryRules['PF'];
+            $employerRate = (float) ($rule->employer_rate ?? 0);
+            if ($employerRate > 0) {
+                $calcOn = strtolower(trim($rule->calculate_on ?? ''));
+                $normCalcOn = str_replace([' ', '+'], '_', $calcOn);
+                if ($calcOn === 'basic' || $calcOn === 'basic + da' || $calcOn === 'basic_da' || $calcOn === 'basic_+_da') {
+                    $baseForPF = $context['basic'] ?? $context['basic_+_da'] ?? $context['basic_da'] ?? 0;
+                } elseif (!empty($normCalcOn) && isset($context[$normCalcOn])) {
+                    $baseForPF = $context[$normCalcOn];
+                } else {
+                    $baseForPF = $totalEarnings;
+                }
+
+                if ($rule->salary_limit > 0 && $baseForPF > $rule->salary_limit) {
+                    $baseForPF = $rule->salary_limit;
+                }
+                $contributions['PF'] = round(($baseForPF * $employerRate) / 100);
+            }
+        }
+
+        // Employer ESI
+        if ($isEsiApplicable && ($this->settings->esi_enabled ?? false) && isset($this->statutoryRules['ESI'])) {
+            $rule = $this->statutoryRules['ESI'];
+            $employerRate = (float) ($rule->employer_rate ?? 0);
+            if ($employerRate > 0) {
+                $calcOn = strtolower(trim($rule->calculate_on ?? ''));
+                $normCalcOn = str_replace([' ', '+'], '_', $calcOn);
+                if ($calcOn === 'basic' || $calcOn === 'basic + da' || $calcOn === 'basic_da' || $calcOn === 'basic_+_da') {
+                    $baseForESI = $context['basic'] ?? $context['basic_+_da'] ?? $context['basic_da'] ?? 0;
+                } elseif (!empty($normCalcOn) && isset($context[$normCalcOn])) {
+                    $baseForESI = $context[$normCalcOn];
+                } else {
+                    $baseForESI = $totalEarnings;
+                }
+
+                $hasLimit = $rule->salary_limit > 0;
+                if (!$hasLimit || $totalEarnings <= $rule->salary_limit) {
+                    $contributions['ESI'] = round(($baseForESI * $employerRate) / 100);
+                }
+            }
+        }
+
+        return $contributions;
+    }
+
+    /**
+     * Calculate working days based on monthly attendance summary data.
+     *
+     * @param mixed $summary An array or object representing the monthly summary.
+     * @return float
+     */
+    public function calculateWorkingDays($summary): float
+    {
+        // Extract values handling both array and object formats
+        $totalPresent = (float) ($summary['total_present'] ?? (is_object($summary) ? $summary->total_present : 0) ?? 0);
+        $totalHalfday = (float) ($summary['total_halfday'] ?? (is_object($summary) ? $summary->total_halfday : 0) ?? 0);
+        $daysOnLeave  = (float) ($summary['days_on_leave'] ?? (is_object($summary) ? $summary->days_on_leave : 0) ?? 0);
+        $totalHolidays = (float) ($summary['total_holidays'] ?? (is_object($summary) ? $summary->total_holidays : 0) ?? 0);
+        $totalWeeklyOffs = (float) ($summary['total_weekly_offs'] ?? (is_object($summary) ? $summary->total_weekly_offs : 0) ?? 0);
+
+        // User requested: "change payable days to like working days and show total working days its not count absent and unpaid leave and count halfday as 0.5"
+        // Working Days = Total Working Days - Absent Days - Unpaid Leave Days - (0.5 * Half Days)
+        
+        $totalWorkingDays = (float) ($summary['total_working_days'] ?? (is_object($summary) ? $summary->total_working_days : 0) ?? 0);
+        $daysAbsent = (float) ($summary['days_absent'] ?? (is_object($summary) ? $summary->days_absent : 0) ?? 0);
+        $unpaidLeaves = (float) ($summary['total_unpaid_leaves'] ?? (is_object($summary) ? $summary->total_unpaid_leaves : 0) ?? 0);
+        
+        // Unpaid half days (or fallback to total_halfday if not tracked yet)
+        $unpaidHalfday = isset($summary['total_unpaid_halfday']) 
+            ? (float) $summary['total_unpaid_halfday'] 
+            : (is_object($summary) && isset($summary->total_unpaid_halfday) ? (float) $summary->total_unpaid_halfday : $totalHalfday);
+
+        // Base it strictly on Working Days (ignores Weekly Offs and Holidays)
+        $workingDays = $totalWorkingDays - $daysAbsent - $unpaidLeaves;
+        
+        // Deduct 0.5 only for unpaid/unauthorized half days
+        $workingDays -= ($unpaidHalfday * 0.5);
+
+        return round($workingDays, 1);
+    }
+
+    /**
+     * Calculate total deduction days based on monthly attendance summary data.
+     *
+     * @param mixed $summary An array or object representing the monthly summary.
+     * @return float
+     */
+    public function calculateTotalDeductionDays($summary): float
+    {
+        $totalHalfday = (float) ($summary['total_halfday'] ?? (is_object($summary) ? $summary->total_halfday : 0) ?? 0);
+        $unpaidHalfday = isset($summary['total_unpaid_halfday']) 
+            ? (float) $summary['total_unpaid_halfday'] 
+            : (is_object($summary) && isset($summary->total_unpaid_halfday) ? (float) $summary->total_unpaid_halfday : $totalHalfday);
+
+        $daysAbsent = (float) ($summary['days_absent'] ?? (is_object($summary) ? $summary->days_absent : 0) ?? 0);
+        $unpaidLeaves = (float) ($summary['total_unpaid_leaves'] ?? (is_object($summary) ? $summary->total_unpaid_leaves : 0) ?? 0);
+        
+        $deductionDays = $daysAbsent + $unpaidLeaves + ($unpaidHalfday * 0.5);
+        
+        return round($deductionDays, 1);
+    }
+}
